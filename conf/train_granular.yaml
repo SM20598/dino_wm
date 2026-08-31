@@ -1,0 +1,14 @@
+defaults:
+  - train
+  - override env: granular_genesis
+  - _self_
+
+# Genesis granular-pile episodes are short (T=21), so use frameskip=1 to get
+# enough (num_hist + num_pred)-length slices per trajectory.
+frameskip: 1
+num_hist: 3
+num_pred: 1
+
+training:
+  batch_size: 8 # lower if you still hit CUDA OOM (each sample carries num_hist+num_pred 224x224 frames through DINO + VQVAE decoder)
+  epochs: 100

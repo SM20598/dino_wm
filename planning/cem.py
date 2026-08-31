@@ -22,6 +22,7 @@ class CEMPlanner(BasePlanner):
         wandb_run,
         logging_prefix="plan_0",
         log_filename="logs.json",
+        action_clip_bounds=None,
         **kwargs,
     ):
         super().__init__(
@@ -40,6 +41,47 @@ class CEMPlanner(BasePlanner):
         self.opt_steps = opt_steps
         self.eval_every = eval_every
         self.logging_prefix = logging_prefix
+
+        # action_clip_bounds: optional [[low, high], ...] of length action_dim,
+        # in RAW (denormalized) units. Candidate actions are sampled here as
+        # unconstrained Gaussian noise around mu (no clipping by default), so
+        # nothing stops a sample from landing far outside any physically
+        # sensible range (e.g. a pusher position outside the workspace) - CEM's
+        # own topk selection doesn't reliably filter these out, since the world
+        # model was never trained on such inputs and may not penalize them
+        # realistically. When set, every sampled action is clamped to this box
+        # (in raw units) immediately after sampling, before the world-model
+        # rollout - see conf/plan_granular.yaml for the granular env's bounds.
+        if action_clip_bounds is not None:
+            # hydra/omegaconf hands this in as a ListConfig of ListConfigs, not
+            # plain python lists - torch.as_tensor doesn't reliably handle
+            # that, so unpack explicitly first.
+            bounds = torch.tensor(
+                [[float(lo), float(hi)] for lo, hi in action_clip_bounds],
+                dtype=torch.float32,
+            )
+            if bounds.shape[0] != action_dim and action_dim % bounds.shape[0] == 0:
+                # action_dim may be the dataset's per-frame action_dim times
+                # frameskip (see plan.py) - tile the per-frame bounds to match.
+                bounds = bounds.repeat(action_dim // bounds.shape[0], 1)
+            assert bounds.shape == (action_dim, 2), (
+                f"action_clip_bounds must be ({action_dim}, 2) (or a divisor "
+                f"of it, for frameskip>1), got {tuple(bounds.shape)}"
+            )
+            self._clip_low = bounds[:, 0]
+            self._clip_high = bounds[:, 1]
+        else:
+            self._clip_low = None
+            self._clip_high = None
+
+    def _clip_action_samples(self, action):
+        """action: (n_samples, horizon, action_dim), normalized. Clamps to
+        self._clip_low/_clip_high (raw units) in place, returns normalized."""
+        if self._clip_low is None:
+            return action
+        raw = self.preprocessor.denormalize_actions(action.detach().cpu())
+        raw = torch.max(torch.min(raw, self._clip_high), self._clip_low)
+        return self.preprocessor.normalize_actions(raw).to(action.device)
 
     def init_mu_sigma(self, obs_0, actions=None):
         """
@@ -104,6 +146,7 @@ class CEMPlanner(BasePlanner):
                     + mu[traj]
                 )
                 action[0] = mu[traj]  # optional: make the first one mu itself
+                action = self._clip_action_samples(action)
                 with torch.no_grad():
                     i_z_obses, i_zs = self.wm.rollout(
                         obs_0=cur_trans_obs_0,

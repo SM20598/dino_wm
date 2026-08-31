@@ -1,0 +1,119 @@
+defaults:
+  - _self_
+  - override hydra/launcher: submitit_slurm
+
+hydra:
+  run:
+    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
+  sweep:
+    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
+    subdir: ${hydra.job.num}
+  launcher:
+    submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+    nodes: 1
+    tasks_per_node: 1
+    cpus_per_task: 16
+    mem_gb: 256
+    gres: "gpu:h100:1"
+    qos: "explore"
+    timeout_min: 720
+    setup: ["export DEBUGVAR=$(scontrol show hostnames $SLURM_JOB_NODELIST)",
+            export MASTER_ADDR="$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)",
+            "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
+
+# model to load for planning - env config (env/granular) is loaded entirely from
+# this checkpoint's own saved hydra.yaml, not from this file.
+ckpt_base_path: /home/sean/pile_manipulation/dino_wm # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
+model_name: 2026-08-28/15-51-05 # granular_genesis run trained on data/dino_wm_angle (5D actions w/ real angle DOF)
+model_epoch: latest
+
+seed: 99
+# Genesis's gs.init() (inside env/granular/granular_env.py) is a process-wide
+# singleton - only one SandboxManipulation instance is supported per process,
+# so n_evals MUST stay 1 for this env.
+n_evals: 1
+goal_source: 'random_state' # -> GranularEnvWrapper.sample_random_init_goal_states:
+                             #    init = a random valid particle scatter (same
+                             #    distribution as training data), goal =
+                             #    particles gathered into a circular target
+                             #    area centered in the box.
+# goal_H=5 matches the paper's own settings (README example, plan_wall.yaml,
+# plan_pusht.yaml all use this) - do not raise this casually. It was bumped
+# to 15 for a longer demo video and that alone (an attention-based predictor
+# at 3x sequence length, plus eval_every triggering real physics rollouts
+# scaled by horizon) made runs take 45+ minutes instead of a few.
+goal_H: 5
+n_plot_samples: 1
+
+debug_dset_init: False
+
+objective:
+  _target_: planning.objectives.create_objective_fn
+  alpha: 1
+  base: 2 # coeff base for weighting all frames. Only applies when mode == 'all'
+  mode: last
+
+planner:
+  _target_: planning.mpc.MPCPlanner
+  # Genuine receding-horizon MPC (bounded, not unlimited): CEM looks ahead
+  # sub_planner.horizon steps but only the first n_taken_actions=1 action is
+  # actually committed each iteration, then it replans from the real
+  # resulting state - unlike n_taken_actions==horizon (tried first), this
+  # carries a warm-started search forward between iterations (memo_actions is
+  # no longer always empty) instead of restarting from a no-op every time,
+  # which is what caused contained_fraction to plateau around 0.6 regardless
+  # of opt_steps. max_iter=25 caps total real pushes near the ~20-push
+  # episode length the model was trained on, instead of looping forever.
+  max_iter: 25
+  n_taken_actions: 1 # no longer overridden to goal_H at runtime - see plan.py's PlanWorkspace.__init__
+  sub_planner:
+    target: planning.cem.CEMPlanner
+    horizon: 5 # still overridden to goal_H at runtime - CEM's lookahead depth
+    topk: 16
+    # CEM batches all num_samples candidate rollouts through the world model's
+    # attention layers in one forward pass. Genesis's own simulation state
+    # (compiled kernels, rigid-body buffers) already holds ~11GB of this GPU's
+    # 16GB in the same process, so num_samples is kept well below the 300 the
+    # paper's own configs use for envs without a live physics sim sharing the
+    # process - raise it if you free up GPU headroom (e.g. run planning
+    # without Genesis's viewer/debug).
+    num_samples: 48
+    var_scale: 1
+    # opt_steps=10 (matching the paper's Table 10 timing benchmark) converged
+    # poorly here: contained_fraction drifted DOWN over 8 MPC iterations
+    # (0.6 -> 0.47), since each iteration's CEM search restarts from a no-op
+    # action with no memory of prior iterations (n_taken_actions == horizon,
+    # so memo_actions is always empty) and 10 steps wasn't enough budget to
+    # reliably find better-than-noop actions in that time. Back to the
+    # generic 30 now that eval_every (not opt_steps) is confirmed to be the
+    # real cost driver - this stays fast since eval_every no longer forces
+    # real Genesis rollouts on every one of these steps.
+    opt_steps: 30
+    # Set far above opt_steps so i % eval_every == 0 only fires at i=0 (one
+    # unavoidable real check at the very start, before any optimization has
+    # happened) instead of at every round. This is the actual dominant cost:
+    # unlike opt_steps, eval_every triggers REAL Genesis physics rollouts, not
+    # fast imagined ones, and CEM's own mu/sigma optimization never uses it -
+    # it's a monitoring/early-stop convenience the paper's own inference-time
+    # benchmark (Table 10) evidently doesn't pay this way for expensive sims.
+    eval_every: 1000
+    # Unclipped Gaussian sampling around mu (see cem.py) could and did produce
+    # actions whose pusher position ended up literally outside the box - a
+    # single planning run showed the pusher rendered ~2x past the box edge.
+    # Bounds are [x_start, y_start, x_end, y_end, angle] in raw units
+    # (meters/radians). xy = box half-extent (granular_vol/2 ~= 0.0635m)
+    # minus the plate's half-width (0.001m) and safety_margin (0.02m) -
+    # matches the "perpendicular" (least restrictive) case of Genesis's own
+    # angle-dependent sample_space formula (sandbox_manipulation.py's
+    # generate_action_samples); the "parallel" case is tighter (~0.0235m), so
+    # this can rarely still let the plate's far corner brush the wall at
+    # angle=0, but that's a soft failure in Genesis (position-controlled),
+    # not worth a per-sample angle-aware bound here. angle = the plate's
+    # actual sampled range, [-pi/2, pi/2].
+    action_clip_bounds:
+      - [-0.045, 0.045]
+      - [-0.045, 0.045]
+      - [-0.045, 0.045]
+      - [-0.045, 0.045]
+      - [-1.5707963267948966, 1.5707963267948966]
+  name: mpc_cem

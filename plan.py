@@ -118,10 +118,12 @@ class PlanWorkspace:
         env_name: str,
         frameskip: int,
         wandb_run: wandb.run,
+        train_dset=None,
     ):
         self.cfg_dict = cfg_dict
         self.wm = wm
         self.dset = dset
+        self.train_dset = train_dset
         self.env = env
         self.env_name = env_name
         self.frameskip = frameskip
@@ -187,11 +189,16 @@ class PlanWorkspace:
             log_filename=self.log_filename,
         )
 
-        # optional: assume planning horizon equals to goal horizon
+        # optional: assume planning horizon equals to goal horizon. n_taken_actions
+        # is intentionally NOT forced to goal_H here - it stays whatever the
+        # planner config set it to (e.g. n_taken_actions=1 for genuine receding-
+        # horizon control: look ahead `goal_H` steps, commit to only the first,
+        # replan from the real resulting state). Every shipped config so far
+        # (plan_wall/plan_pusht/plan_point_maze) sets n_taken_actions == goal_H
+        # in its own yaml anyway, so this doesn't change their behavior.
         from planning.mpc import MPCPlanner
         if isinstance(self.planner, MPCPlanner):
             self.planner.sub_planner.horizon = cfg_dict["goal_H"]
-            self.planner.n_taken_actions = cfg_dict["goal_H"]
         else:
             self.planner.horizon = cfg_dict["goal_H"]
 
@@ -228,6 +235,43 @@ class PlanWorkspace:
             self.obs_g = obs_g
             self.state_0 = rand_init_state  # (b, d)
             self.state_g = rand_goal_state
+            self.gt_actions = None
+        elif self.goal_source == "dset_far":
+            # init = a real training trajectory's first recorded state, goal =
+            # its LAST recorded state. Unlike goal_source='dset' (which only
+            # samples a goal `goal_H` steps away - matching the planner's own
+            # imagination depth, so init and goal can end up barely
+            # distinguishable), this deliberately picks a goal far beyond any
+            # single CEM lookahead, so reaching it genuinely exercises
+            # receding-horizon replanning over many real pushes, not a
+            # near-no-op. Uses self.train_dset (not the held-out val split)
+            # since the point is to check "can the model reach a goal it was
+            # directly trained on", ruling out a generalization gap as the
+            # explanation if it can't.
+            if self.train_dset is None:
+                raise ValueError("goal_source='dset_far' requires train_dset (see plan.py's planning_main)")
+            init_states, goal_states, env_info = [], [], []
+            for _ in range(self.n_evals):
+                traj_id = random.randint(0, len(self.train_dset) - 1)
+                _, _, state, e_info = self.train_dset[traj_id]
+                state = state.numpy()
+                init_states.append(state[0])
+                goal_states.append(state[-1])
+                env_info.append(e_info)
+            init_states = np.array(init_states)
+            goal_states = np.array(goal_states)
+
+            self.env.update_env(env_info)
+            obs_0, state_0 = self.env.prepare(self.eval_seed, init_states)
+            obs_g, state_g = self.env.prepare(self.eval_seed, goal_states)
+            for k in obs_0.keys():
+                obs_0[k] = np.expand_dims(obs_0[k], axis=1)
+                obs_g[k] = np.expand_dims(obs_g[k], axis=1)
+
+            self.obs_0 = obs_0
+            self.obs_g = obs_g
+            self.state_0 = init_states
+            self.state_g = goal_states
             self.gt_actions = None
         else:
             # update env config from val trajs
@@ -352,7 +396,7 @@ class PlanWorkspace:
 
 def load_ckpt(snapshot_path, device):
     with snapshot_path.open("rb") as f:
-        payload = torch.load(f, map_location=device)
+        payload = torch.load(f, map_location=device, weights_only=False)
     loaded_keys = []
     result = {}
     for k, v in payload.items():
@@ -444,13 +488,14 @@ def planning_main(cfg_dict):
         model_cfg = OmegaConf.load(f)
 
     seed(cfg_dict["seed"])
-    _, dset = hydra.utils.call(
+    _, dset_splits = hydra.utils.call(
         model_cfg.env.dataset,
         num_hist=model_cfg.num_hist,
         num_pred=model_cfg.num_pred,
         frameskip=model_cfg.frameskip,
     )
-    dset = dset["valid"]
+    dset = dset_splits["valid"]
+    train_dset = dset_splits["train"]
 
     num_action_repeat = model_cfg.num_action_repeat
     model_ckpt = (
@@ -458,8 +503,10 @@ def planning_main(cfg_dict):
     )
     model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
 
-    # use dummy vector env for wall and deformable envs
-    if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
+    # use dummy vector env for wall, deformable, and granular envs (each wraps
+    # sim state that isn't fork/pickle-safe for SubprocVectorEnv - genesis's
+    # gs.init() in particular is a process-wide singleton, see env/granular/)
+    if model_cfg.env.name in ("wall", "deformable_env", "granular_genesis"):
         from env.serial_vector_env import SerialVectorEnv
         env = SerialVectorEnv(
             [
@@ -483,6 +530,7 @@ def planning_main(cfg_dict):
         cfg_dict=cfg_dict,
         wm=model,
         dset=dset,
+        train_dset=train_dset,
         env=env,
         env_name=model_cfg.env.name,
         frameskip=model_cfg.frameskip,

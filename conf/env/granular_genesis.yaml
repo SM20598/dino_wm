@@ -1,0 +1,17 @@
+name: granular_genesis
+args: []
+kwargs: {}
+
+dataset:
+  _target_: "datasets.genesis_granular_dset.load_genesis_granular_slice_train_val"
+  n_rollout: null
+  normalize_action: ${normalize_action}
+  data_path: /home/sean/pile_manipulation/data/dino_wm_angle_density/cube/n30/size0.012
+  obs_type: occupancy # "occupancy" (rasterized particles) or "rendered" (camera frames)
+  split_ratio: 0.9
+  transform:
+    _target_: "datasets.img_transforms.default_transform"
+    img_size: ${img_size}
+
+decoder_path: null
+num_workers: 8

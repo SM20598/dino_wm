@@ -2,6 +2,9 @@ import os
 import torch
 import imageio
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from einops import rearrange, repeat
 from utils import (
     cfg_to_dict,
@@ -12,6 +15,108 @@ from utils import (
     concat_trajdict,
 )
 from torchvision import utils
+from eval_open_loop import ActionCalibration, draw_action
+
+GT_COLOR = "#2ca02c"    # green - executed in the real env
+PRED_COLOR = "#1f77b4"  # blue - imagined by the world model
+CTX_COLOR = "#888888"   # gray - frame the world model was given, not predicted
+GOAL_COLOR = "#ff7f0e"  # orange - target the planner was optimizing for
+
+
+def _get_action_calibration(env, display_size):
+    """
+    Builds an ActionCalibration (see eval_open_loop.py) from the live env if
+    it's our Genesis-backed occupancy-raster granular env - duck-typed via
+    the `rasterizer` attribute so this is a no-op (returns None) for every
+    other env (wall, pusht, ...), which have no such projection.
+    """
+    try:
+        raw_env = env.envs[0].unwrapped
+        raw_h, raw_w = raw_env.rasterizer._output_grid.shape
+        return ActionCalibration(raw_h, raw_w, display_size)
+    except AttributeError:
+        return None
+
+
+def _tint(img_chw, color_hex):
+    """img_chw: (3,H,W) tensor in [-1,1]. Returns (H,W,3) array in `color_hex`."""
+    gray = ((img_chw.mean(0) + 1) / 2).clamp(0, 1).detach().numpy()
+    rgb = np.array(matplotlib.colors.to_rgb(color_hex))
+    return gray[..., None] * rgb[None, None, :]
+
+
+def _plot_rollout_compare_labeled(
+    e_visuals, i_visuals, goal_visual, successes, n_ctx, filename,
+    exec_actions=None, calib=None,
+):
+    """
+    e_visuals, i_visuals: (b, T, c, h, w) in [-1, 1] - executed vs. imagined rollout.
+    goal_visual: (b, 1, c, h, w) in [-1, 1] - the planning target.
+    successes: (b,) bool.
+    n_ctx: how many of i_visuals' leading columns are the world model's given
+        context (re-encoded/decoded, not genuine predictions).
+    exec_actions: (b, T-1, action_dim) raw (denormalized, meters) actions
+        actually executed, action t taking column t -> t+1. None if the env
+        doesn't support the pixel calibration (see _get_action_calibration).
+    calib: ActionCalibration for projecting exec_actions into pixel space, or None.
+    """
+    b, T = e_visuals.shape[:2]
+    for idx in range(b):
+        fig, axes = plt.subplots(2, T + 1, figsize=(1.9 * (T + 1), 4.2), squeeze=False)
+        goal_chw = goal_visual[idx, 0]
+
+        for t in range(T):
+            ax_gt, ax_pred = axes[0, t], axes[1, t]
+            ax_gt.imshow(_tint(e_visuals[idx, t], GT_COLOR))
+            ax_gt.set_title(f"t={t}", fontsize=9)
+
+            if calib is not None and exec_actions is not None and t < exec_actions.shape[1]:
+                x0, y0, x1, y1 = exec_actions[idx, t, :4]
+                if exec_actions.shape[-1] >= 5:
+                    angle = float(exec_actions[idx, t, 4])  # true plate orientation
+                else:
+                    # legacy 4D actions have no separate angle dim - approximate
+                    # with the travel direction (see granular_env.py's old step()).
+                    angle = float(np.arctan2(y1 - y0, x1 - x0))
+                start_px = calib.project(np.array([x0, y0]))
+                end_px = calib.project(np.array([x1, y1]))
+                draw_action(ax_gt, start_px, end_px, angle, "white", calib.marker_size)
+
+            if t < n_ctx:
+                ax_pred.set_facecolor("#222222")
+                ax_pred.text(0.5, 0.5, "context", color=CTX_COLOR, ha="center", va="center",
+                             fontsize=8, transform=ax_pred.transAxes)
+                pred_color = CTX_COLOR
+            else:
+                ax_pred.imshow(_tint(i_visuals[idx, t], PRED_COLOR))
+                pred_color = PRED_COLOR
+
+            for ax, color in ((ax_gt, GT_COLOR), (ax_pred, pred_color)):
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_edgecolor(color)
+                    spine.set_linewidth(2.5)
+
+        for row in (0, 1):
+            ax = axes[row, T]
+            ax.imshow(_tint(goal_chw, GOAL_COLOR))
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_edgecolor(GOAL_COLOR)
+                spine.set_linewidth(3.0)
+        axes[0, T].set_title("GOAL", fontsize=9, color=GOAL_COLOR, fontweight="bold")
+
+        axes[0, 0].set_ylabel("Ground Truth\n(executed)", color=GT_COLOR, fontsize=10, fontweight="bold")
+        axes[1, 0].set_ylabel("Predicted\n(world model)", color=PRED_COLOR, fontsize=10, fontweight="bold")
+
+        success_tag = "success" if successes[idx] else "failure"
+        fig.suptitle(f"sample {idx} - {success_tag}", fontsize=11)
+        fig.tight_layout(w_pad=0.3, h_pad=0.6, rect=[0, 0, 1, 0.95])
+        out_path = f"{filename}.png" if b == 1 else f"{filename}_{idx}.png"
+        fig.savefig(out_path, dpi=150)
+        plt.close(fig)
 
 
 class PlanEvaluator:  # evaluator for planning
@@ -141,6 +246,7 @@ class PlanEvaluator:  # evaluator for planning
                 successes=successes,
                 save_video=save_video,
                 filename=filename,
+                exec_actions=exec_actions,
             )
 
         return logs, successes, e_obses, e_states
@@ -186,16 +292,21 @@ class PlanEvaluator:  # evaluator for planning
         return logs, successes
 
     def _plot_rollout_compare(
-        self, e_visuals, i_visuals, successes, save_video=False, filename=""
+        self, e_visuals, i_visuals, successes, save_video=False, filename="", exec_actions=None
     ):
         """
         i_visuals may have less frames than e_visuals due to frameskip, so pad accordingly
         e_visuals: (b, t, h, w, c)
         i_visuals: (b, t, h, w, c)
         goal: (b, h, w, c)
+        exec_actions: (b, t-1, action_dim) raw (denormalized) actions actually
+            executed, for overlaying start/end pusher pose + direction on the
+            executed-frame row. None (or an unsupported env) silently skips it.
         """
         e_visuals = e_visuals[: self.n_plot_samples]
         i_visuals = i_visuals[: self.n_plot_samples]
+        if exec_actions is not None:
+            exec_actions = exec_actions[: self.n_plot_samples]
         goal_visual = self.obs_g["visual"][: self.n_plot_samples]
         goal_visual = self.preprocessor.transform_obs_visual(goal_visual)
 
@@ -248,22 +359,15 @@ class PlanEvaluator:  # evaluator for planning
             i_visuals.shape[1] == n_columns
         ), f"Rollout lengths do not match, {e_visuals.shape[1]} and {i_visuals.shape[1]}"
 
-        # add a goal column
-        e_visuals = torch.cat([e_visuals.cpu(), goal_visual - correction], dim=1)
-        i_visuals = torch.cat([i_visuals.cpu(), goal_visual - correction], dim=1)
-        rollout = torch.cat([e_visuals.cpu() - correction, i_visuals.cpu()], dim=1)
-        n_columns += 1
-
-        imgs_for_plotting = rearrange(rollout, "b h c w1 w2 -> (b h) c w1 w2")
-        imgs_for_plotting = (
-            imgs_for_plotting * 2 - 1
-            if imgs_for_plotting.min() >= 0
-            else imgs_for_plotting
-        )
-        utils.save_image(
-            imgs_for_plotting,
-            f"{filename}.png",
-            nrow=n_columns,  # nrow is the number of columns
-            normalize=True,
-            value_range=(-1, 1),
+        n_ctx = self.obs_0["visual"].shape[1]  # frames the world model was given, not predicted
+        calib = _get_action_calibration(self.env, e_visuals.shape[-1])
+        _plot_rollout_compare_labeled(
+            e_visuals=e_visuals.cpu(),
+            i_visuals=i_visuals.cpu(),
+            goal_visual=goal_visual.cpu(),
+            successes=successes,
+            n_ctx=n_ctx,
+            filename=filename,
+            exec_actions=exec_actions,
+            calib=calib,
         )
