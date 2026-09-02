@@ -236,24 +236,32 @@ class PlanWorkspace:
             self.state_0 = rand_init_state  # (b, d)
             self.state_g = rand_goal_state
             self.gt_actions = None
-        elif self.goal_source == "dset_far":
-            # init = a real training trajectory's first recorded state, goal =
-            # its LAST recorded state. Unlike goal_source='dset' (which only
+        elif self.goal_source in ("dset_far", "dset_far_valid"):
+            # init = a real trajectory's first recorded state, goal = its
+            # LAST recorded state. Unlike goal_source='dset' (which only
             # samples a goal `goal_H` steps away - matching the planner's own
             # imagination depth, so init and goal can end up barely
             # distinguishable), this deliberately picks a goal far beyond any
             # single CEM lookahead, so reaching it genuinely exercises
             # receding-horizon replanning over many real pushes, not a
-            # near-no-op. Uses self.train_dset (not the held-out val split)
-            # since the point is to check "can the model reach a goal it was
-            # directly trained on", ruling out a generalization gap as the
-            # explanation if it can't.
-            if self.train_dset is None:
-                raise ValueError("goal_source='dset_far' requires train_dset (see plan.py's planning_main)")
+            # near-no-op.
+            # dset_far uses self.train_dset - checks "can the model reach a
+            # goal it was directly trained on", ruling out a generalization
+            # gap as the explanation if it can't.
+            # dset_far_valid uses self.dset (the held-out split) - checks
+            # whether that capability (or lack of it) generalizes beyond
+            # memorized training trajectories, i.e. genuine planning vs
+            # overfitting to trajectories it has actually seen.
+            if self.goal_source == "dset_far":
+                if self.train_dset is None:
+                    raise ValueError("goal_source='dset_far' requires train_dset (see plan.py's planning_main)")
+                source_dset = self.train_dset
+            else:
+                source_dset = self.dset
             init_states, goal_states, env_info = [], [], []
             for _ in range(self.n_evals):
-                traj_id = random.randint(0, len(self.train_dset) - 1)
-                _, _, state, e_info = self.train_dset[traj_id]
+                traj_id = random.randint(0, len(source_dset) - 1)
+                _, _, state, e_info = source_dset[traj_id]
                 state = state.numpy()
                 init_states.append(state[0])
                 goal_states.append(state[-1])

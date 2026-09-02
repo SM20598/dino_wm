@@ -24,7 +24,7 @@ hydra:
 # model to load for planning - env config (env/granular) is loaded entirely from
 # this checkpoint's own saved hydra.yaml, not from this file.
 ckpt_base_path: /home/sean/pile_manipulation/dino_wm # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
-model_name: 2026-08-28/15-51-05 # granular_genesis run trained on data/dino_wm_angle (5D actions w/ real angle DOF)
+model_name: 2026-08-31/14-52-20 # cluster-trained run (GH200) on data/dino_wm_angle_density_1000 (5D actions, density-weighted push sampler)
 model_epoch: latest
 
 seed: 99
