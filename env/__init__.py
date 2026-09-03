@@ -32,3 +32,10 @@ register(
     max_episode_steps=300,
     reward_threshold=1.0,
 )
+
+register(
+    id="granular_genesis",
+    entry_point="env.granular.granular_env_wrapper:GranularEnvWrapper",
+    max_episode_steps=20,
+    reward_threshold=1.0,
+)
